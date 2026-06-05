@@ -1,0 +1,12 @@
+# This package exists only because Cargo currently cannot specify target-specific crate-type:
+# https://github.com/rust-lang/cargo/issues/12260
+[package]
+name = "sokol-rust-imgui-template-android"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+sokol-rust-imgui-template = { path = "../.." }
