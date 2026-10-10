@@ -5,6 +5,17 @@ edition = "2024"
 
 [dependencies]
 imgui = { git = "https://github.com/imgui-rs/imgui-rs", rev = "e06b05c0f97062af4ea7856ecc5a7216feb3ace2" }
-sokol = { git = "https://github.com/floooh/sokol-rust", rev = "9e3db76ac4d090d04cca4fc10cc8a1336452f44d" }
+sokol = { git = "https://github.com/floooh/sokol-rust", rev = "1a5cb2251865109b8a213fb22f8e6c40af25f211" }
 # Parse fonts ourselves until imgui-rs gets updated and loses the glyph_ranges requirement
 ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
+
+[profile.dev]
+# Never build without optimizations
+opt-level = 1
+# We do not debug anyway
+debug = "line-tables-only"
+
+[profile.release]
+# Enable backtrace info
+debug = "line-tables-only"
+# debug = "none"

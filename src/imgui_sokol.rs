@@ -4,8 +4,10 @@
 /// https://github.com/floooh/sokol/blob/master/util/sokol_imgui.h
 use sokol::{app as sapp, gfx as sg};
 use std::path::PathBuf;
+use std::ptr;
 use std::sync::OnceLock;
 
+use crate::sg_util::DynamicBuffer;
 use crate::{sg_util, shaders::imgui_shader};
 
 // In emscripten we need to dynamically check if the user is running on macos or other OS for shortcuts (Ctrl+C/Cmd+C
@@ -84,8 +86,14 @@ pub struct ImguiSokol {
     desc: ImguiSetupDesc,
     shader: sg::Shader,
     pipeline: sg::Pipeline,
-    vertex_buf: sg::Buffer,
-    index_buf: sg::Buffer,
+    // imgui-rs uses Rust borrow checker for statically enforcing imgui constraint (DrawData() is valid after Render()
+    // until NextFrame()), but it backfires for us: we can no longer split the processing of DrawData into "upload data
+    // to buffers" and "issue draw commands" as required by new Sokol API for updating the buffers.
+    //
+    // We use raw pointers to turn the static check into dynamic check (see assert()s).
+    cur_draw_data: *const imgui::DrawData,
+    vertex_buf: DynamicBuffer,
+    index_buf: DynamicBuffer,
     default_sampler: sg::Sampler,
     vertices: Vec<imgui::DrawVert>,
     indices: Vec<imgui::DrawIdx>,
@@ -105,8 +113,9 @@ impl ImguiSokol {
             desc: ImguiSetupDesc::default(),
             shader: sg::Shader::new(),
             pipeline: sg::Pipeline::new(),
-            vertex_buf: sg::Buffer::new(),
-            index_buf: sg::Buffer::new(),
+            cur_draw_data: ptr::null(),
+            vertex_buf: DynamicBuffer::new(sg_util::DynamicBufferType::VERTEX),
+            index_buf: DynamicBuffer::new(sg_util::DynamicBufferType::INDEX),
             default_sampler: sg::Sampler::new(),
             vertices: vec![],
             indices: vec![],
@@ -226,10 +235,9 @@ impl ImguiSokol {
         self.pipeline = sg::Pipeline::new();
         sg::destroy_shader(self.shader);
         self.shader = sg::Shader::new();
-        sg::destroy_buffer(self.index_buf);
-        self.index_buf = sg::Buffer::new();
-        sg::destroy_buffer(self.vertex_buf);
-        self.vertex_buf = sg::Buffer::new();
+
+        self.vertex_buf.destroy();
+        self.index_buf.destroy();
 
         self.vertices.clear();
         self.indices.clear();
@@ -244,8 +252,17 @@ impl ImguiSokol {
     }
 
     /// Start a new ImGui frame.
-    pub fn new_frame(&mut self, width: i32, height: i32, delta_time: f64, dpi_scale: f32) {
+    pub fn new_frame(
+        &mut self,
+        width: i32,
+        height: i32,
+        delta_time: f64,
+        dpi_scale: f32,
+    ) -> &mut imgui::Ui {
         assert!(width > 0 && height > 0);
+
+        // Calling new_frame resets current draw data.
+        self.cur_draw_data = ptr::null();
 
         self.cur_dpi_scale = if dpi_scale > 0.0 { dpi_scale } else { 1.0 };
 
@@ -260,44 +277,51 @@ impl ImguiSokol {
         if let Some(cursor) = self.context.mouse_cursor() {
             sapp::set_mouse_cursor(map_cursor(cursor));
         }
+
+        self.context.new_frame()
     }
 
-    /// Renders all ImGui draw data, must be called inside a sg render pass.
-    pub fn render(&mut self) {
-        let disp_size = self.context.io().display_size;
+    /// Prepares all ImGui draw data and uploads to GPU, must be called outside of a sg render pass, before calling
+    /// render() and after calling new_frame().
+    pub fn prepare_data(&mut self) {
+        assert!(
+            self.cur_draw_data.is_null(),
+            "prepare_data() must be called after new_frame()"
+        );
+
+        self.vertices.clear();
+        self.indices.clear();
+
         let draw_data = self.context.render();
+        self.cur_draw_data = draw_data as *const imgui::DrawData;
         if draw_data.draw_lists_count() == 0 {
+            return;
+        }
+
+        // Copy all vertex and index data into intermediate buffers and update GPU buffers.
+        for draw_list in draw_data.draw_lists() {
+            self.vertices.extend_from_slice(draw_list.vtx_buffer());
+            self.indices.extend_from_slice(draw_list.idx_buffer());
+        }
+        self.vertex_buf.upload(&self.vertices);
+        self.index_buf.upload(&self.indices);
+    }
+
+    /// Renders all ImGui draw data, must be called inside a sg render pass, after calling prepare_data().
+    pub fn render(&self) {
+        // Skip rendering if there is no UI.
+        if self.vertices.is_empty() {
             return;
         }
 
         sg::push_debug_group("imgui-sokol");
 
-        // Copy all vertex and index data into intermediate buffers and update GPU buffers.
-        self.vertices.clear();
-        self.indices.clear();
-        for draw_list in draw_data.draw_lists() {
-            self.vertices.extend_from_slice(draw_list.vtx_buffer());
-            self.indices.extend_from_slice(draw_list.idx_buffer());
-        }
-        sg_util::update_dynamic_buffer(
-            &mut self.vertex_buf,
-            sg::BufferUsage {
-                vertex_buffer: true,
-                stream_update: true,
-                ..Default::default()
-            },
-            &self.vertices,
+        assert!(
+            !self.cur_draw_data.is_null(),
+            "render() must be called after prepare_data()"
         );
-        sg_util::update_dynamic_buffer(
-            &mut self.index_buf,
-            sg::BufferUsage {
-                index_buffer: true,
-                stream_update: true,
-                ..Default::default()
-            },
-            &self.indices,
-        );
-
+        let draw_data = unsafe { &*self.cur_draw_data };
+        let disp_size = self.context.io().display_size;
         let fb_scale = draw_data.framebuffer_scale;
         let fb_width = (disp_size[0] * fb_scale[0]) as i32;
         let fb_height = (disp_size[1] * fb_scale[1]) as i32;
@@ -311,8 +335,8 @@ impl ImguiSokol {
         sg_util::apply_uniforms(imgui_shader::UB_VS_PARAMS, &vs_params);
 
         let mut bind = sg::Bindings::new();
-        bind.vertex_buffers[0] = self.vertex_buf;
-        bind.index_buffer = self.index_buf;
+        bind.vertex_buffers[0] = self.vertex_buf.buffer();
+        bind.index_buffer = self.index_buf.buffer();
 
         let mut vb_offset = 0;
         let mut ib_offset = 0;

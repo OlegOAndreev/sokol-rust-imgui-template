@@ -43,7 +43,7 @@ struct State {
     tri_shader: sg::Shader,
     tri_pipeline: sg::Pipeline,
     tri_bind: sg::Bindings,
-    tri_vertex_buf: sg::Buffer,
+    tri_vertex_buf: sg_util::DynamicBuffer,
     imgui: ImguiSokol,
     imgui_sample_text: String,
     color0: [f32; 3],
@@ -83,7 +83,7 @@ fn init(state: &mut State) {
         ..Default::default()
     });
 
-    state.tri_vertex_buf = sg::Buffer::new();
+    state.tri_vertex_buf = sg_util::DynamicBuffer::new(sg_util::DynamicBufferType::VERTEX);
     state.tri_shader = sg::make_shader(&triangle_shader::triangle_shader_desc(sg::query_backend()));
 
     let mut tri_layout = sg::VertexLayoutState::new();
@@ -155,30 +155,24 @@ fn update_time(state: &mut State) -> f64 {
 }
 
 fn render(state: &mut State) {
-    sg::begin_pass(&sg::Pass {
-        action: state.pass_action,
-        swapchain: sglue::swapchain(),
-        ..Default::default()
-    });
-
     #[rustfmt::skip]
     let tri_verts: [f32; _] = [
         -0.5, -0.5, 0.0, state.color0[0], state.color0[1], state.color0[2],
          0.5, -0.5, 0.0, state.color1[0], state.color1[1], state.color1[2],
          0.0,  0.5, 0.0, state.color2[0], state.color2[1], state.color2[2],
     ];
-    crate::sg_util::update_dynamic_buffer(
-        &mut state.tri_vertex_buf,
-        sg::BufferUsage {
-            vertex_buffer: true,
-            stream_update: true,
-            ..Default::default()
-        },
-        &tri_verts,
-    );
+    state.tri_vertex_buf.upload(&tri_verts);
+
+    state.imgui.prepare_data();
+
+    sg::begin_pass(&sg::Pass {
+        action: state.pass_action,
+        swapchain: sglue::swapchain(),
+        ..Default::default()
+    });
 
     sg::apply_pipeline(state.tri_pipeline);
-    state.tri_bind.vertex_buffers[0] = state.tri_vertex_buf;
+    state.tri_bind.vertex_buffers[0] = state.tri_vertex_buf.buffer();
     sg::apply_bindings(&state.tri_bind);
     sg::draw(0, 3, 1);
 
@@ -188,11 +182,9 @@ fn render(state: &mut State) {
 }
 
 fn ui_frame(state: &mut State, dt: f64) {
-    state
+    let ui = state
         .imgui
         .new_frame(sapp::width(), sapp::height(), dt, sapp::dpi_scale());
-
-    let ui = state.imgui.context_mut().frame();
 
     ui.window("Hello, imgui!")
         .position([400.0, 20.0], imgui::Condition::FirstUseEver)
@@ -403,12 +395,11 @@ extern "C" fn cleanup_cb(user_data: *mut ffi::c_void) {
 
 fn cleanup(state: &mut State) {
     state.imgui.shutdown();
-    sg::destroy_buffer(state.tri_vertex_buf);
-    state.tri_vertex_buf = sg::Buffer::new();
     sg::destroy_pipeline(state.tri_pipeline);
     state.tri_pipeline = sg::Pipeline::new();
     sg::destroy_shader(state.tri_shader);
     state.tri_shader = sg::Shader::new();
+    state.tri_vertex_buf.destroy();
     sg::shutdown();
 }
 
@@ -456,7 +447,7 @@ pub fn new_sapp_desc() -> sapp::Desc {
         tri_shader: sg::Shader::new(),
         tri_pipeline: sg::Pipeline::new(),
         tri_bind: sg::Bindings::new(),
-        tri_vertex_buf: sg::Buffer::new(),
+        tri_vertex_buf: sg_util::DynamicBuffer::new(sg_util::DynamicBufferType::VERTEX),
         imgui: ImguiSokol::new(),
         color0: [1.0, 0.0, 0.0],
         color1: [0.0, 1.0, 0.0],

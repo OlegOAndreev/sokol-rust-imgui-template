@@ -8,7 +8,7 @@ use std::backtrace::Backtrace;
 #[cfg(not(target_os = "emscripten"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn abort() -> ! {
-    eprintln!("Aborted!\n{}", Backtrace::capture());
+    eprintln!("Aborted!\n{}", Backtrace::force_capture());
 
     std::process::exit(1);
 }

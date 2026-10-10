@@ -1,14 +1,16 @@
 #!/bin/sh
 
-set -eu
+set -e
 
 if [ -z "${EMSDK:-}" ]; then
     echo "Error: no EMSDK found. Did you forget to install and activate Emscripten SDK? Run 'source emsdk_env.sh' first."
     exit 1
 fi
 
-PROFILE=$1
-shift
+PROFILE=${1:-dev}
+if [ $# -gt 0 ]; then
+    shift
+fi
 
 cd `dirname $0`/..
 

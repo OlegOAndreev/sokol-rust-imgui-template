@@ -1,9 +1,11 @@
 #!/bin/sh
 
-set -eu
+set -e
 
-PROFILE=$1
-shift
+PROFILE=${1:-dev}
+if [ $# -gt 0 ]; then
+    shift
+fi
 
 cd `dirname $0`/..
 ./emscripten/build.sh $PROFILE
