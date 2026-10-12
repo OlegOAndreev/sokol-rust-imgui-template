@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::OnceLock;
 
-use crate::sg_util::DynamicBuffer;
 use crate::{sg_util, shaders::imgui_shader};
 
 // In emscripten we need to dynamically check if the user is running on macos or other OS for shortcuts (Ctrl+C/Cmd+C
@@ -92,8 +91,8 @@ pub struct ImguiSokol {
     //
     // We use raw pointers to turn the static check into dynamic check (see assert()s).
     cur_draw_data: *const imgui::DrawData,
-    vertex_buf: DynamicBuffer,
-    index_buf: DynamicBuffer,
+    vertex_buf: sg::Buffer,
+    index_buf: sg::Buffer,
     default_sampler: sg::Sampler,
     vertices: Vec<imgui::DrawVert>,
     indices: Vec<imgui::DrawIdx>,
@@ -114,8 +113,8 @@ impl ImguiSokol {
             shader: sg::Shader::new(),
             pipeline: sg::Pipeline::new(),
             cur_draw_data: ptr::null(),
-            vertex_buf: DynamicBuffer::new(sg_util::DynamicBufferType::VERTEX),
-            index_buf: DynamicBuffer::new(sg_util::DynamicBufferType::INDEX),
+            vertex_buf: sg::Buffer::new(),
+            index_buf: sg::Buffer::new(),
             default_sampler: sg::Sampler::new(),
             vertices: vec![],
             indices: vec![],
@@ -155,6 +154,24 @@ impl ImguiSokol {
             sg::ColorMask::Rgb
         };
 
+        self.vertex_buf = sg::make_buffer(&sg::BufferDesc {
+            size: 1,
+            usage: sg::BufferUsage {
+                vertex_buffer: true,
+                write_transient: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        self.index_buf = sg::make_buffer(&sg::BufferDesc {
+            size: 1,
+            usage: sg::BufferUsage {
+                index_buffer: true,
+                write_transient: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
         self.shader = sg::make_shader(&imgui_shader::imgui_shader_desc(sg::query_backend()));
         let mut layout = sg::VertexLayoutState::new();
         layout.attrs[imgui_shader::ATTR_IMGUI_POSITION] = sg::VertexAttrState {
@@ -236,8 +253,10 @@ impl ImguiSokol {
         sg::destroy_shader(self.shader);
         self.shader = sg::Shader::new();
 
-        self.vertex_buf.destroy();
-        self.index_buf.destroy();
+        sg::destroy_buffer(self.vertex_buf);
+        self.vertex_buf = sg::Buffer::new();
+        sg::destroy_buffer(self.index_buf);
+        self.index_buf = sg::Buffer::new();
 
         self.vertices.clear();
         self.indices.clear();
@@ -303,8 +322,8 @@ impl ImguiSokol {
             self.vertices.extend_from_slice(draw_list.vtx_buffer());
             self.indices.extend_from_slice(draw_list.idx_buffer());
         }
-        self.vertex_buf.upload(&self.vertices);
-        self.index_buf.upload(&self.indices);
+        sg_util::update_transient_buffer(&mut self.vertex_buf, &self.vertices);
+        sg_util::update_transient_buffer(&mut self.index_buf, &self.indices);
     }
 
     /// Renders all ImGui draw data, must be called inside a sg render pass, after calling prepare_data().
@@ -335,8 +354,8 @@ impl ImguiSokol {
         sg_util::apply_uniforms(imgui_shader::UB_VS_PARAMS, &vs_params);
 
         let mut bind = sg::Bindings::new();
-        bind.vertex_buffers[0] = self.vertex_buf.buffer();
-        bind.index_buffer = self.index_buf.buffer();
+        bind.vertex_buffers[0] = self.vertex_buf;
+        bind.index_buffer = self.index_buf;
 
         let mut vb_offset = 0;
         let mut ib_offset = 0;

@@ -12,3 +12,11 @@ pub extern "C" fn abort() -> ! {
 
     std::process::exit(1);
 }
+
+/// Callbacks with `extern "C"` abort when panic is caught: https://doc.rust-lang.org/nomicon/ffi.html#ffi-and-unwinding
+/// Use a guard to ignore the panic and output an error log.
+pub fn ffi_guard<F: FnOnce() + std::panic::UnwindSafe>(what: &str, f: F) {
+    if std::panic::catch_unwind(f).is_err() {
+        eprintln!("=== Panic in {what} callback was ignored ===");
+    }
+}
