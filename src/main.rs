@@ -57,7 +57,7 @@ impl AudioState {
     fn stream(self: &mut Self, buffer: &mut [f32], num_frames: usize, num_channels: usize) {
         // Play 3 sine waves, interpolating between current and desired state if needed. Buffer size is large enough for
         // CROSSFADE_MS to be shorter than one buffer for typical sample rates.
-        const CROSSFADE_MS: usize = 10;
+        const CROSSFADE_MS: usize = 15;
         let crossfade_frames =
             (CROSSFADE_MS * saudio::sample_rate() as usize / 1000).min(num_frames);
 
@@ -124,7 +124,6 @@ struct State {
     fps: f64,
     frame_count: u64,
     fps_update_timer: f64,
-    audio_started: bool,
     audio_enabled: bool,
     audio_control: Arc<AudioControl>,
 }
@@ -218,15 +217,7 @@ impl State {
             },
             ..Default::default()
         };
-    }
 
-    // This is used to support web builds: web audio can only be initialized when the user does an action, delay
-    // initializing saudio.
-    fn setup_audio(self: &mut Self) {
-        if self.audio_started {
-            return;
-        }
-        self.audio_started = true;
         let audio_state = Box::new(AudioState {
             num_frames: 0,
             cur_pitch: [0.0; 3],
@@ -250,14 +241,6 @@ impl State {
         const QUIT_MODIFIER: u32 = sapp::MODIFIER_SUPER;
         #[cfg(not(target_os = "macos"))]
         const QUIT_MODIFIER: u32 = sapp::MODIFIER_CTRL;
-
-        // See start_audio for why this is needed on the web.
-        if event._type == sapp::EventType::KeyDown
-            || event._type == sapp::EventType::MouseDown
-            || event._type == sapp::EventType::TouchesBegan
-        {
-            self.setup_audio();
-        }
 
         if event._type == sapp::EventType::KeyDown {
             if event.key_code == sapp::Keycode::Q && event.modifiers & QUIT_MODIFIER != 0 {
@@ -459,7 +442,6 @@ pub fn new_sapp_desc() -> sapp::Desc {
         frame_count: 0,
         fps_update_timer: 0.0,
         imgui_sample_text: "type here...".into(),
-        audio_started: false,
         audio_enabled: false,
         audio_control,
     });
