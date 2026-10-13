@@ -345,6 +345,16 @@ impl State {
                 ui.spacing();
 
                 ui.checkbox("Play audio", &mut self.audio_enabled);
+                if saudio::sample_rate() != 0 {
+                    ui.text(format!(
+                        "Sample rate: {}, channels: {}, buffer size: {}",
+                        saudio::sample_rate(),
+                        saudio::channels(),
+                        saudio::buffer_frames()
+                    ));
+                } else {
+                    ui.text("");
+                }
                 if self.audio_enabled {
                     let (pitch0, amplitude0) = color_to_pitch_and_amplitude(&self.color0);
                     self.audio_control.set_sine(0, pitch0, amplitude0);
