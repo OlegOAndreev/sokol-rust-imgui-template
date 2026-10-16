@@ -35,7 +35,7 @@ jobs:
       - name: Verify Emscripten
         run: emcc -v
       - name: Build dist
-        run: ./emscripten/build.sh dist
+        run: ./emscripten/build.sh dist --features egui
       - name: Setup Pages
         uses: actions/configure-pages@v5
       - name: Upload artifact

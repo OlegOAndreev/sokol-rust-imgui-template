@@ -4,7 +4,6 @@ rustflags = [
     "-C", "link-arg=-msimd128",
     "-C", "link-arg=-sSTACK_SIZE=1Mb",
     "-C", "link-arg=-sUSE_WEBGL2",
-    "-C", "link-arg=-sWASM_BINDGEN",
-    "-C", "link-arg=-Wno-experimental",
+    "-C", "link-arg=-Wno-deprecated",
     "-C", "link-arg=-sEXPORTED_FUNCTIONS=_main,__emscripten_stack_restore"
 ]

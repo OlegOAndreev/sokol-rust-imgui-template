@@ -5,7 +5,12 @@ use std::ffi;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+#[cfg(feature = "egui")]
+use crate::egui_sokol::EguiSokol;
+
 mod abort_hook;
+#[cfg(feature = "egui")]
+mod egui_sokol;
 mod imgui_sokol;
 mod sg_util;
 mod shaders;
@@ -54,7 +59,7 @@ extern "C" fn audio_stream_cb(
 }
 
 impl AudioState {
-    fn stream(self: &mut Self, buffer: &mut [f32], num_frames: usize, num_channels: usize) {
+    fn stream(&mut self, buffer: &mut [f32], num_frames: usize, num_channels: usize) {
         // Play 3 sine waves, interpolating between current and desired state if needed. Buffer size is large enough for
         // CROSSFADE_MS to be shorter than one buffer for typical sample rates.
         const CROSSFADE_MS: usize = 15;
@@ -67,9 +72,9 @@ impl AudioState {
         let (pitch0, amplitude0) = self.control.get_sine(0);
         let (pitch1, amplitude1) = self.control.get_sine(1);
         let (pitch2, amplitude2) = self.control.get_sine(2);
+        let (cur_pitch0, cur_amplitude0) = (self.cur_pitch[0], self.cur_amplitude[0]);
         let (cur_pitch1, cur_amplitude1) = (self.cur_pitch[1], self.cur_amplitude[1]);
         let (cur_pitch2, cur_amplitude2) = (self.cur_pitch[2], self.cur_amplitude[2]);
-        let (cur_pitch0, cur_amplitude0) = (self.cur_pitch[0], self.cur_amplitude[0]);
         // Skip crossfading if the parameters have not changed.
         let crossfade_needed = pitch0 != cur_pitch0
             || amplitude0 != cur_amplitude0
@@ -116,7 +121,9 @@ struct State {
     tri_bind: sg::Bindings,
     tri_vertex_buf: sg::Buffer,
     imgui: ImguiSokol,
-    imgui_sample_text: String,
+    #[cfg(feature = "egui")]
+    egui: EguiSokol,
+    sample_text: String,
     color0: [f32; 3],
     color1: [f32; 3],
     color2: [f32; 3],
@@ -158,7 +165,7 @@ extern "C" fn cleanup_cb(user_data: *mut ffi::c_void) {
 }
 
 impl State {
-    fn init(self: &mut Self) {
+    fn init(&mut self) {
         sg::setup(&sg::Desc {
             environment: sglue::environment(),
             logger: sg::Logger {
@@ -203,9 +210,11 @@ impl State {
 
         self.imgui.setup(&crate::imgui_sokol::ImguiSetupDesc {
             font_density: sapp::dpi_scale(),
-            font_ttf_data: Some((include_bytes!("../data/fonts/DroidSans.ttf"), 16.0)),
+            font_ttf_data: Some((crate::imgui_sokol::FONT_TTF_DATA, 16.0)),
             ..Default::default()
         });
+        #[cfg(feature = "egui")]
+        self.egui.setup();
 
         self.pass_action.colors[0] = sg::ColorAttachmentAction {
             load_action: sg::LoadAction::Clear,
@@ -236,7 +245,7 @@ impl State {
         });
     }
 
-    fn on_event(self: &mut Self, event: &sapp::Event) {
+    fn on_event(&mut self, event: &sapp::Event) {
         #[cfg(target_os = "macos")]
         const QUIT_MODIFIER: u32 = sapp::MODIFIER_SUPER;
         #[cfg(not(target_os = "macos"))]
@@ -252,9 +261,11 @@ impl State {
         }
 
         self.imgui.handle_event(event);
+        #[cfg(feature = "egui")]
+        self.egui.handle_event(event);
     }
 
-    fn frame(self: &mut Self) {
+    fn frame(&mut self) {
         let dt = self.update_time();
         self.ui_frame(dt);
 
@@ -262,7 +273,7 @@ impl State {
         sg::commit();
     }
 
-    fn update_time(self: &mut Self) -> f64 {
+    fn update_time(&mut self) -> f64 {
         let now = stm::now();
         let dt = stm::sec(now - self.last_frame_time);
         self.last_frame_time = now;
@@ -273,17 +284,18 @@ impl State {
             self.frame_count = 0;
             self.fps_update_timer = 0.0;
         }
-        dt
+        // Clamp the frame time to some upper bound to prevent explosive animations etc on application pause.
+        dt.min(0.1)
     }
 
-    fn render(self: &mut Self) {
+    fn render(&mut self) {
         #[rustfmt::skip]
         let tri_verts: [f32; _] = [
             -0.5, -0.5, 0.0, self.color0[0], self.color0[1], self.color0[2],
              0.5, -0.5, 0.0, self.color1[0], self.color1[1], self.color1[2],
              0.0,  0.5, 0.0, self.color2[0], self.color2[1], self.color2[2],
         ];
-        sg_util::update_transient_buffer(&mut self.tri_vertex_buf, &tri_verts);
+        sg_util::update_buffer_transient(&mut self.tri_vertex_buf, &tri_verts);
 
         self.imgui.prepare_data();
 
@@ -299,11 +311,13 @@ impl State {
         sg::draw(0, 3, 1);
 
         self.imgui.render();
+        #[cfg(feature = "egui")]
+        self.egui.render();
 
         sg::end_pass();
     }
 
-    fn ui_frame(self: &mut Self, dt: f64) {
+    fn ui_frame(&mut self, dt: f64) {
         let ui = self
             .imgui
             .new_frame(sapp::width(), sapp::height(), dt, sapp::dpi_scale());
@@ -331,8 +345,7 @@ impl State {
                 ui.spacing();
 
                 ui.text("Text input:");
-                ui.input_text("##imgui_text", &mut self.imgui_sample_text)
-                    .build();
+                ui.input_text("##text", &mut self.sample_text).build();
 
                 ui.separator();
                 ui.text("Vertex colors:");
@@ -355,18 +368,6 @@ impl State {
                 } else {
                     ui.text("");
                 }
-                if self.audio_enabled {
-                    let (pitch0, amplitude0) = color_to_pitch_and_amplitude(&self.color0);
-                    self.audio_control.set_sine(0, pitch0, amplitude0);
-                    let (pitch1, amplitude1) = color_to_pitch_and_amplitude(&self.color1);
-                    self.audio_control.set_sine(1, pitch1, amplitude1);
-                    let (pitch2, amplitude2) = color_to_pitch_and_amplitude(&self.color2);
-                    self.audio_control.set_sine(2, pitch2, amplitude2);
-                } else {
-                    self.audio_control.set_sine(0, 0.0, 0.0);
-                    self.audio_control.set_sine(1, 0.0, 0.0);
-                    self.audio_control.set_sine(2, 0.0, 0.0);
-                }
 
                 ui.spacing();
                 ui.separator();
@@ -379,10 +380,97 @@ impl State {
                     }
                 });
             });
+
+        #[cfg(feature = "egui")]
+        self.egui_ui(dt);
+
+        // Play the vertex colors as sine waves, no matter which UI changed them.
+        for (idx, color) in [self.color0, self.color1, self.color2].iter().enumerate() {
+            let (pitch, amplitude) = if self.audio_enabled {
+                color_to_pitch_and_amplitude(color)
+            } else {
+                (0.0, 0.0)
+            };
+            self.audio_control.set_sine(idx, pitch, amplitude);
+        }
     }
 
-    fn cleanup(self: &mut Self) {
+    #[cfg(feature = "egui")]
+    fn egui_ui(&mut self, dt: f64) {
+        self.egui
+            .run_frame(sapp::width(), sapp::height(), dt, sapp::dpi_scale(), |ui| {
+                egui::Window::new("Hello, egui!")
+                    .default_pos([20.0, 20.0])
+                    .default_size([360.0, 520.0])
+                    .show(ui.ctx(), |ui| {
+                        ui.label(format!("Framebuffer: {}x{}", sapp::width(), sapp::height()));
+                        ui.label(format!("FPS: {:.1}", self.fps));
+                        ui.horizontal(|ui| {
+                            ui.label("DPI scale: ");
+                            ui.label(format!("{:.2}", sapp::dpi_scale()));
+                        });
+                        let fullscreen_title = if sapp::is_fullscreen() {
+                            "Toggle Windowed"
+                        } else {
+                            "Toggle Fullscreen"
+                        };
+                        if ui.button(fullscreen_title).clicked() {
+                            sapp::toggle_fullscreen();
+                        }
+
+                        ui.separator();
+
+                        ui.label("Text input:");
+                        ui.text_edit_singleline(&mut self.sample_text);
+
+                        ui.separator();
+                        ui.label("Vertex colors:");
+                        ui.horizontal(|ui| {
+                            ui.label("V0");
+                            ui.color_edit_button_rgb(&mut self.color0);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("V1");
+                            ui.color_edit_button_rgb(&mut self.color1);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("V2");
+                            ui.color_edit_button_rgb(&mut self.color2);
+                        });
+
+                        ui.separator();
+
+                        ui.checkbox(&mut self.audio_enabled, "Play audio");
+                        if saudio::sample_rate() != 0 {
+                            ui.label(format!(
+                                "Sample rate: {}, channels: {}, buffer size: {}",
+                                saudio::sample_rate(),
+                                saudio::channels(),
+                                saudio::buffer_frames()
+                            ));
+                        } else {
+                            ui.label("");
+                        }
+
+                        ui.separator();
+
+                        ui.label("Scroll test:");
+                        egui::ScrollArea::vertical()
+                            .id_salt("scroll")
+                            .auto_shrink(false)
+                            .show(ui, |ui| {
+                                for i in 0..200 {
+                                    ui.label(format!("This is row {}/200", i + 1));
+                                }
+                            });
+                    });
+            });
+    }
+
+    fn cleanup(&mut self) {
         self.imgui.shutdown();
+        #[cfg(feature = "egui")]
+        self.egui.shutdown();
         sg::destroy_pipeline(self.tri_pipeline);
         self.tri_pipeline = sg::Pipeline::new();
         sg::destroy_shader(self.tri_shader);
@@ -444,6 +532,8 @@ pub fn new_sapp_desc() -> sapp::Desc {
         tri_bind: sg::Bindings::new(),
         tri_vertex_buf: sg::Buffer::new(),
         imgui: ImguiSokol::new(),
+        #[cfg(feature = "egui")]
+        egui: EguiSokol::new(),
         color0: [1.0, 0.0, 0.0],
         color1: [0.0, 1.0, 0.0],
         color2: [0.0, 0.0, 1.0],
@@ -451,7 +541,7 @@ pub fn new_sapp_desc() -> sapp::Desc {
         fps: 0.0,
         frame_count: 0,
         fps_update_timer: 0.0,
-        imgui_sample_text: "type here...".into(),
+        sample_text: "type here...".into(),
         audio_enabled: false,
         audio_control,
     });

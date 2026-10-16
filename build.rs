@@ -47,6 +47,7 @@ fn main() {
     }
     shader_names.sort();
     println!("cargo:rerun-if-changed={}", shader_dir.display());
+    println!("cargo:rerun-if-changed={}", shdc_bin.display());
 
     // Compile each shader with sokol-shdc
     for name in &shader_names {

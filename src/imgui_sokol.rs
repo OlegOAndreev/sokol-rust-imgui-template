@@ -9,10 +9,13 @@ use std::sync::OnceLock;
 
 use crate::{sg_util, shaders::imgui_shader};
 
+/// TTF font data for the UI font (DroidSans), shared by the ImGui and egui UIs.
+pub const FONT_TTF_DATA: &[u8] = include_bytes!("../data/fonts/DroidSans.ttf");
+
 // In emscripten we need to dynamically check if the user is running on macos or other OS for shortcuts (Ctrl+C/Cmd+C
 // etc). See
 // https://developer.mozilla.org/en-US/docs/Web/API/Navigator/platform#determining_the_modifier_key_for_the_users_platform
-fn ui_is_macos() -> bool {
+pub fn is_macos() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
         #[cfg(not(target_os = "emscripten"))]
@@ -35,6 +38,26 @@ fn ui_is_macos() -> bool {
             result
         }
     })
+}
+
+fn is_ctrl_modifier(event: &sapp::Event) -> bool {
+    if is_macos() {
+        event.modifiers & sapp::MODIFIER_SUPER != 0
+    } else {
+        event.modifiers & sapp::MODIFIER_CTRL != 0
+    }
+}
+
+pub fn is_cut_command(event: &sapp::Event) -> bool {
+    is_ctrl_modifier(event) && event.key_code == sapp::Keycode::X
+}
+
+pub fn is_copy_command(event: &sapp::Event) -> bool {
+    is_ctrl_modifier(event) && event.key_code == sapp::Keycode::C
+}
+
+pub fn is_paste_command(event: &sapp::Event) -> bool {
+    is_ctrl_modifier(event) && event.key_code == sapp::Keycode::V
 }
 
 struct SappClipboardBackend {}
@@ -62,10 +85,6 @@ pub struct ImguiSetupDesc {
     pub font_ttf_data: Option<(&'static [u8], f32)>,
     /// Path where ImGui stores/loads UI persistency data (None = disabled)
     pub ini_filename: Option<String>,
-    /// If true, don't forward Ctrl-V paste events
-    pub disable_paste_override: bool,
-    /// If true, alpha values get written into the framebuffer
-    pub write_alpha_channel: bool,
 }
 
 impl Default for ImguiSetupDesc {
@@ -74,8 +93,6 @@ impl Default for ImguiSetupDesc {
             font_density: 1.0,
             font_ttf_data: None,
             ini_filename: None,
-            disable_paste_override: false,
-            write_alpha_channel: false,
         }
     }
 }
@@ -139,7 +156,7 @@ impl ImguiSokol {
         {
             let io = self.context.io_mut();
             io.display_size = [1.0, 1.0];
-            io.config_mac_os_behaviors = ui_is_macos();
+            io.config_mac_os_behaviors = is_macos();
             io.config_windows_resize_from_edges = true;
             io.config_input_text_cursor_blink = false;
             io.backend_flags
@@ -147,12 +164,6 @@ impl ImguiSokol {
             io.backend_flags
                 .insert(imgui::BackendFlags::HAS_MOUSE_CURSORS);
         }
-
-        let write_mask = if self.desc.write_alpha_channel {
-            sg::ColorMask::Rgba
-        } else {
-            sg::ColorMask::Rgb
-        };
 
         self.vertex_buf = sg::make_buffer(&sg::BufferDesc {
             size: 1,
@@ -196,26 +207,17 @@ impl ImguiSokol {
             index_type: sg::IndexType::Uint16,
             primitive_type: sg::PrimitiveType::Triangles,
             color_count: 1,
-            label: c"imgui-sokol-pipeline".as_ptr(),
             ..Default::default()
         };
         pipeline_desc.colors[0] = sg::ColorTargetState {
-            write_mask,
+            write_mask: sg::ColorMask::Rgb,
             blend: sg::BlendState {
                 enabled: true,
                 src_factor_rgb: sg::BlendFactor::SrcAlpha,
                 dst_factor_rgb: sg::BlendFactor::OneMinusSrcAlpha,
                 op_rgb: sg::BlendOp::Add,
-                src_factor_alpha: if self.desc.write_alpha_channel {
-                    sg::BlendFactor::One
-                } else {
-                    sg::BlendFactor::SrcAlpha
-                },
-                dst_factor_alpha: if self.desc.write_alpha_channel {
-                    sg::BlendFactor::One
-                } else {
-                    sg::BlendFactor::OneMinusSrcAlpha
-                },
+                src_factor_alpha: sg::BlendFactor::SrcAlpha,
+                dst_factor_alpha: sg::BlendFactor::OneMinusSrcAlpha,
                 op_alpha: sg::BlendOp::Add,
             },
             ..Default::default()
@@ -227,7 +229,6 @@ impl ImguiSokol {
             mag_filter: sg::Filter::Nearest,
             wrap_u: sg::Wrap::ClampToEdge,
             wrap_v: sg::Wrap::ClampToEdge,
-            label: c"imgui-sokol-default-sampler".as_ptr(),
             ..Default::default()
         });
 
@@ -293,7 +294,9 @@ impl ImguiSokol {
         io.display_framebuffer_scale = [self.cur_dpi_scale, self.cur_dpi_scale];
         io.delta_time = delta_time as f32;
 
-        if let Some(cursor) = self.context.mouse_cursor() {
+        if let Some(cursor) = self.context.mouse_cursor()
+            && self.context().io().want_capture_mouse
+        {
             sapp::set_mouse_cursor(map_cursor(cursor));
         }
 
@@ -322,12 +325,17 @@ impl ImguiSokol {
             self.vertices.extend_from_slice(draw_list.vtx_buffer());
             self.indices.extend_from_slice(draw_list.idx_buffer());
         }
-        sg_util::update_transient_buffer(&mut self.vertex_buf, &self.vertices);
-        sg_util::update_transient_buffer(&mut self.index_buf, &self.indices);
+        sg_util::update_buffer_transient(&mut self.vertex_buf, &self.vertices);
+        sg_util::update_buffer_transient(&mut self.index_buf, &self.indices);
     }
 
     /// Renders all ImGui draw data, must be called inside a sg render pass, after calling prepare_data().
     pub fn render(&self) {
+        assert!(
+            !self.cur_draw_data.is_null(),
+            "render() must be called after prepare_data()"
+        );
+
         // Skip rendering if there is no UI.
         if self.vertices.is_empty() {
             return;
@@ -335,10 +343,6 @@ impl ImguiSokol {
 
         sg::push_debug_group("imgui-sokol");
 
-        assert!(
-            !self.cur_draw_data.is_null(),
-            "render() must be called after prepare_data()"
-        );
         let draw_data = unsafe { &*self.cur_draw_data };
         let disp_size = self.context.io().display_size;
         let fb_scale = draw_data.framebuffer_scale;
@@ -360,16 +364,12 @@ impl ImguiSokol {
         let mut vb_offset = 0;
         let mut ib_offset = 0;
 
-        for (idx, draw_list) in draw_data.draw_lists().enumerate() {
+        for draw_list in draw_data.draw_lists() {
             bind.vertex_buffer_offsets[0] = vb_offset;
             bind.index_buffer_offset = ib_offset;
-            // Do not apply bindings for first element: we will apply them later when switching textures anyway.
-            if idx > 0 {
-                sg::apply_bindings(&bind);
-            }
             // Always apply bindings for the first command in draw_list, because vb_offset and ib_offset got updated.
-            let mut prev_tex_id = imgui::TextureId::new(usize::MAX);
-            let mut prev_vtx_offset = usize::MAX;
+            let mut cur_texture_id = None;
+            let mut cur_vtx_offset = None;
 
             for cmd in draw_list.commands() {
                 match cmd {
@@ -378,21 +378,25 @@ impl ImguiSokol {
                             continue;
                         }
 
-                        let tex_id = cmd_params.texture_id;
+                        let texture_id = cmd_params.texture_id;
                         // Reapply bindings if the texture or vtx_offset has changed.
-                        if prev_tex_id != tex_id || prev_vtx_offset != cmd_params.vtx_offset {
-                            if let Some((view, sampler)) = self.textures.get(tex_id) {
+                        if cur_texture_id != Some(texture_id)
+                            || cur_vtx_offset != Some(cmd_params.vtx_offset)
+                        {
+                            if let Some((view, sampler)) = self.textures.get(texture_id) {
                                 bind.views[imgui_shader::VIEW_TEX] = *view;
                                 bind.samplers[imgui_shader::SMP_SMP] = *sampler;
                             } else {
-                                eprintln!("Unknown texture id {:?} is passed", tex_id);
+                                eprintln!("imgui-sokol: Unknown texture id {:?}", texture_id);
                                 continue;
                             }
+                            // Each mesh has its own vertex range in the shared vertex buffer. sg::draw() has no
+                            // base_vertex parameter, so the range is selected here via the vertex buffer offset.
                             bind.vertex_buffer_offsets[0] = vb_offset
                                 + (cmd_params.vtx_offset * size_of::<imgui::DrawVert>()) as i32;
                             sg::apply_bindings(&bind);
-                            prev_tex_id = tex_id;
-                            prev_vtx_offset = cmd_params.vtx_offset;
+                            cur_texture_id = Some(texture_id);
+                            cur_vtx_offset = Some(cmd_params.vtx_offset);
                         }
 
                         let clip = cmd_params.clip_rect;
@@ -424,16 +428,43 @@ impl ImguiSokol {
     /// Handle sapp event, returns true if imgui wants to capture keyboard/mouse input.
     pub fn handle_event(&mut self, event: &sapp::Event) -> bool {
         let dpi_scale = self.cur_dpi_scale;
-        let disable_paste = self.desc.disable_paste_override;
 
         let io = self.context.io_mut();
 
         match event._type {
-            sapp::EventType::Focused => {
-                io.app_focus_lost = false;
+            sapp::EventType::KeyDown | sapp::EventType::KeyUp => {
+                update_modifiers_io(io, event.modifiers);
+
+                // Skip processing Ctrl/Cmd+V, it triggers a separate ClipboardPasted event
+                if let Some(key) = map_keycode(event.key_code)
+                    && !is_paste_command(event)
+                {
+                    let down = event._type == sapp::EventType::KeyDown;
+                    io.add_key_event(key, down);
+                }
             }
-            sapp::EventType::Unfocused => {
-                io.app_focus_lost = true;
+            sapp::EventType::Char => {
+                update_modifiers_io(io, event.modifiers);
+                // Skip characters that are a side effect of a command (e.g. Cmd+C emits a 'c', and Delete emits a
+                // control character on macOS).
+                if (event.modifiers & (sapp::MODIFIER_CTRL | sapp::MODIFIER_SUPER)) == 0
+                    && let Some(ch) = char::from_u32(event.char_code)
+                    && is_printable_char(ch)
+                {
+                    io.add_input_character(ch);
+                }
+            }
+            sapp::EventType::MouseDown | sapp::EventType::MouseUp => {
+                let down = event._type == sapp::EventType::MouseDown;
+                io.add_mouse_pos_event([event.mouse_x / dpi_scale, event.mouse_y / dpi_scale]);
+                io.add_mouse_button_event(mouse_button_to_imgui(event.mouse_button), down);
+                update_modifiers_io(io, event.modifiers);
+            }
+            sapp::EventType::MouseScroll => {
+                io.add_mouse_wheel_event([event.scroll_x, event.scroll_y]);
+            }
+            sapp::EventType::MouseMove => {
+                io.add_mouse_pos_event([event.mouse_x / dpi_scale, event.mouse_y / dpi_scale]);
             }
             sapp::EventType::MouseEnter | sapp::EventType::MouseLeave => {
                 // See comment in https://github.com/floooh/sokol/blob/master/util/sokol_imgui.h for why this is
@@ -452,18 +483,6 @@ impl ImguiSokol {
                         false,
                     );
                 }
-            }
-            sapp::EventType::MouseDown | sapp::EventType::MouseUp => {
-                let down = event._type == sapp::EventType::MouseDown;
-                io.add_mouse_pos_event([event.mouse_x / dpi_scale, event.mouse_y / dpi_scale]);
-                io.add_mouse_button_event(mouse_button_to_imgui(event.mouse_button), down);
-                update_modifiers_io(io, event.modifiers);
-            }
-            sapp::EventType::MouseMove => {
-                io.add_mouse_pos_event([event.mouse_x / dpi_scale, event.mouse_y / dpi_scale]);
-            }
-            sapp::EventType::MouseScroll => {
-                io.add_mouse_wheel_event([event.scroll_x, event.scroll_y]);
             }
             sapp::EventType::TouchesBegan => {
                 if event.num_touches > 0 {
@@ -485,43 +504,24 @@ impl ImguiSokol {
             sapp::EventType::TouchesEnded | sapp::EventType::TouchesCancelled => {
                 io.add_mouse_button_event(imgui::MouseButton::Left, false);
             }
-            sapp::EventType::KeyDown | sapp::EventType::KeyUp => {
-                update_modifiers_io(io, event.modifiers);
-
-                let is_ctrl = if ui_is_macos() {
-                    event.modifiers & sapp::MODIFIER_SUPER != 0
-                } else {
-                    event.modifiers & sapp::MODIFIER_CTRL != 0
-                };
-                if !disable_paste && is_ctrl && event.key_code == sapp::Keycode::V {
-                    // Handled by ClipboardPasted event
-                } else {
-                    // On web platform, don't forward Ctrl-X, Ctrl-V to the browser
-                    if is_ctrl
-                        && (event.key_code == sapp::Keycode::X
-                            || event.key_code == sapp::Keycode::C)
-                    {
-                        sapp::consume_event();
-                    }
-                    if let Some(key) = map_keycode(event.key_code) {
-                        let down = event._type == sapp::EventType::KeyDown;
-                        io.add_key_event(key, down);
-                    }
-                }
+            sapp::EventType::Focused => {
+                io.app_focus_lost = false;
             }
-            sapp::EventType::Char => {
-                update_modifiers_io(io, event.modifiers);
-                if (event.modifiers
-                    & (sapp::MODIFIER_ALT | sapp::MODIFIER_CTRL | sapp::MODIFIER_SUPER))
-                    == 0
-                    && let Some(ch) = char::from_u32(event.char_code)
-                {
-                    io.add_input_character(ch);
-                }
+            sapp::EventType::Unfocused => {
+                io.app_focus_lost = true;
             }
-            sapp::EventType::ClipboardPasted if !disable_paste => {
-                // Simulate a Ctrl-V key down/up
-                let ctrl = if ui_is_macos() {
+            sapp::EventType::ClipboardPasted => {
+                // Simulate a Ctrl+V key down/up, like sokol_imgui.h does: ImGui then pastes the text that the clipboard
+                // backend reads.
+                //
+                // We may skip processing this event on the native, but we must process it on the web: unlike the
+                // native, we can read the latest clipboard contents only after receiving the ClipboardPasted event: the
+                // pasted contents arrives with this event and gets stored in the internal sapp buffer. If we process
+                // Ctrl/Cmd+V directly, we may read the stale contents of clipboard.
+                //
+                // The current code (copied from imgui_sokol.h) basically sends Ctrl/Cmd+V to imgui twice, but only
+                // the second time the clipboard is guaranteed to have the current contents.
+                let ctrl = if is_macos() {
                     imgui::Key::ModSuper
                 } else {
                     imgui::Key::ModCtrl
@@ -531,7 +531,15 @@ impl ImguiSokol {
                 io.add_key_event(imgui::Key::V, false);
                 io.add_key_event(ctrl, false);
             }
-            _ => {}
+            sapp::EventType::Invalid
+            | sapp::EventType::Resized
+            | sapp::EventType::Iconified
+            | sapp::EventType::Restored
+            | sapp::EventType::Suspended
+            | sapp::EventType::Resumed
+            | sapp::EventType::QuitRequested
+            | sapp::EventType::FilesDropped
+            | sapp::EventType::Num => {}
         }
 
         let io = self.context.io();
@@ -580,7 +588,6 @@ impl ImguiSokol {
             height,
             pixel_format: sg::PixelFormat::Rgba8,
             data: sg::ImageData { mip_levels },
-            label: c"imgui-sokol-font-image".as_ptr(),
             ..Default::default()
         });
 
@@ -589,7 +596,6 @@ impl ImguiSokol {
                 image: self.font_texture,
                 ..Default::default()
             },
-            label: c"imgui-sokol-font-view".as_ptr(),
             ..Default::default()
         });
 
@@ -598,7 +604,6 @@ impl ImguiSokol {
             mag_filter: sg::Filter::Linear,
             wrap_u: sg::Wrap::ClampToEdge,
             wrap_v: sg::Wrap::ClampToEdge,
-            label: c"imgui-sokol-font-sampler".as_ptr(),
             ..Default::default()
         });
 
@@ -883,6 +888,15 @@ fn build_glyph_ranges(ttf_data: &[u8]) -> imgui::FontGlyphRanges {
     imgui::FontGlyphRanges::from_slice(Vec::leak(ranges))
 }
 
+/// Control characters (e.g. the delete key on macOS) and private use area characters should not be inserted as text.
+pub fn is_printable_char(chr: char) -> bool {
+    let is_in_private_use_area = ('\u{e000}'..='\u{f8ff}').contains(&chr)
+        || ('\u{f0000}'..='\u{ffffd}').contains(&chr)
+        || ('\u{100000}'..='\u{10fffd}').contains(&chr);
+
+    !is_in_private_use_area && !chr.is_ascii_control()
+}
+
 fn update_modifiers_io(io: &mut imgui::Io, modifiers: u32) {
     io.add_key_event(imgui::Key::ModCtrl, modifiers & sapp::MODIFIER_CTRL != 0);
     io.add_key_event(imgui::Key::ModShift, modifiers & sapp::MODIFIER_SHIFT != 0);
@@ -895,7 +909,7 @@ fn mouse_button_to_imgui(btn: sapp::Mousebutton) -> imgui::MouseButton {
         sapp::Mousebutton::Left => imgui::MouseButton::Left,
         sapp::Mousebutton::Right => imgui::MouseButton::Right,
         sapp::Mousebutton::Middle => imgui::MouseButton::Middle,
-        _ => imgui::MouseButton::Left,
+        sapp::Mousebutton::Invalid => imgui::MouseButton::Left,
     }
 }
 
@@ -1006,7 +1020,22 @@ fn map_keycode(keycode: sapp::Keycode) -> Option<imgui::Key> {
         sapp::Keycode::RightAlt => imgui::Key::RightAlt,
         sapp::Keycode::RightSuper => imgui::Key::RightSuper,
         sapp::Keycode::Menu => imgui::Key::Menu,
-        _ => return None,
+        sapp::Keycode::Invalid
+        | sapp::Keycode::World1
+        | sapp::Keycode::World2
+        | sapp::Keycode::F13
+        | sapp::Keycode::F14
+        | sapp::Keycode::F15
+        | sapp::Keycode::F16
+        | sapp::Keycode::F17
+        | sapp::Keycode::F18
+        | sapp::Keycode::F19
+        | sapp::Keycode::F20
+        | sapp::Keycode::F21
+        | sapp::Keycode::F22
+        | sapp::Keycode::F23
+        | sapp::Keycode::F24
+        | sapp::Keycode::F25 => return None,
     })
 }
 
