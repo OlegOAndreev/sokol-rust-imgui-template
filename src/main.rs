@@ -1,3 +1,4 @@
+use crate::frame_manager::FrameManager;
 use crate::imgui_sokol::ImguiSokol;
 use crate::shaders::triangle_shader;
 use sokol::{app as sapp, audio as saudio, gfx as sg, glue as sglue, time as stm};
@@ -11,6 +12,7 @@ use crate::egui_sokol::EguiSokol;
 mod abort_hook;
 #[cfg(feature = "egui")]
 mod egui_sokol;
+mod frame_manager;
 mod imgui_sokol;
 mod sg_util;
 mod shaders;
@@ -127,10 +129,7 @@ struct State {
     color0: [f32; 3],
     color1: [f32; 3],
     color2: [f32; 3],
-    last_frame_time: u64,
-    fps: f64,
-    frame_count: u64,
-    fps_update_timer: f64,
+    frame_manager: FrameManager,
     audio_enabled: bool,
     audio_control: Arc<AudioControl>,
 }
@@ -246,6 +245,8 @@ impl State {
     }
 
     fn on_event(&mut self, event: &sapp::Event) {
+        self.frame_manager.on_event(event);
+
         #[cfg(target_os = "macos")]
         const QUIT_MODIFIER: u32 = sapp::MODIFIER_SUPER;
         #[cfg(not(target_os = "macos"))]
@@ -266,26 +267,14 @@ impl State {
     }
 
     fn frame(&mut self) {
-        let dt = self.update_time();
+        let Some(dt) = self.frame_manager.begin_frame() else {
+            return;
+        };
+
         self.ui_frame(dt);
 
         self.render();
         sg::commit();
-    }
-
-    fn update_time(&mut self) -> f64 {
-        let now = stm::now();
-        let dt = stm::sec(now - self.last_frame_time);
-        self.last_frame_time = now;
-        self.frame_count += 1;
-        self.fps_update_timer += dt;
-        if self.fps_update_timer >= 0.5 {
-            self.fps = self.frame_count as f64 / self.fps_update_timer;
-            self.frame_count = 0;
-            self.fps_update_timer = 0.0;
-        }
-        // Clamp the frame time to some upper bound to prevent explosive animations etc on application pause.
-        dt.min(0.1)
     }
 
     fn render(&mut self) {
@@ -327,7 +316,15 @@ impl State {
             .size([360.0, 520.0], imgui::Condition::FirstUseEver)
             .build(|| {
                 ui.text(format!("Framebuffer: {}x{}", sapp::width(), sapp::height()));
-                ui.text(format!("FPS: {:.1}", self.fps));
+                ui.text(format!(
+                    "FPS: {:.1} {}",
+                    self.frame_manager.fps(),
+                    if self.frame_manager.will_idle() {
+                        "(idle)"
+                    } else {
+                        ""
+                    }
+                ));
                 ui.text("DPI scale: ");
                 ui.same_line();
                 ui.text(format!("{:.2}", sapp::dpi_scale()));
@@ -404,7 +401,16 @@ impl State {
                     .default_size([360.0, 520.0])
                     .show(ui.ctx(), |ui| {
                         ui.label(format!("Framebuffer: {}x{}", sapp::width(), sapp::height()));
-                        ui.label(format!("FPS: {:.1}", self.fps));
+                        ui.label(format!(
+                            "FPS: {:.1} {}",
+                            self.frame_manager.fps(),
+                            if self.frame_manager.will_idle() {
+                                "(idle)"
+                            } else {
+                                ""
+                            }
+                        ));
+
                         ui.horizontal(|ui| {
                             ui.label("DPI scale: ");
                             ui.label(format!("{:.2}", sapp::dpi_scale()));
@@ -537,10 +543,7 @@ pub fn new_sapp_desc() -> sapp::Desc {
         color0: [1.0, 0.0, 0.0],
         color1: [0.0, 1.0, 0.0],
         color2: [0.0, 0.0, 1.0],
-        last_frame_time: stm::now(),
-        fps: 0.0,
-        frame_count: 0,
-        fps_update_timer: 0.0,
+        frame_manager: FrameManager::new(true),
         sample_text: "type here...".into(),
         audio_enabled: false,
         audio_control,
